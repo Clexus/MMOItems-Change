@@ -6,6 +6,7 @@ import io.lumine.mythic.lib.command.CommandTreeNode;
 import net.Indyuce.mmoitems.MMOItems;
 import net.Indyuce.mmoitems.api.event.MMOItemsReloadEvent;
 import net.Indyuce.mmoitems.api.util.MMOItemReforger;
+import net.Indyuce.mmoitems.gui.UpgradeStationGUI;
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
 import org.bukkit.command.CommandSender;
@@ -70,6 +71,8 @@ public class ReloadCommandTreeNode extends CommandTreeNode {
         MMOItems.plugin.getTemplates().reload();
         MMOItems.plugin.getStats().reload(true);
         MMOItems.plugin.getCrafting().reload();
+        UpgradeStationGUI.closeAll();
+        UpgradeStationGUI.reloadConfigFromDisk();
         sender.sendMessage(MMOItems.plugin.getPrefix() + MMOItems.plugin.getName() + " "
                 + MMOItems.plugin.getDescription().getVersion() + " reloaded.");
         sender.sendMessage(MMOItems.plugin.getPrefix() + "- " + ChatColor.RED

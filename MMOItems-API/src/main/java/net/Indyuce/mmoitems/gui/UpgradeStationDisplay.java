@@ -44,6 +44,10 @@ class UpgradeStationDisplay {
         this.gui = gui;
     }
 
+    private boolean hasSlot(int slot) {
+        return slot >= 0 && slot < gui.getInventorySize();
+    }
+
     void updateAllDisplays() {
         updatePreview();
         updateProgressBar();
@@ -52,8 +56,9 @@ class UpgradeStationDisplay {
     }
 
     private void updatePreview() {
-        Inventory inventory = gui.getInventory();
-        ItemStack targetItem = inventory.getItem(gui.getSlotTargetItem());
+        if (!hasSlot(gui.getSlotPreview())) return;
+
+        ItemStack targetItem = gui.getItemAt(gui.getSlotTargetItem());
 
         ItemStack previewItem;
 
@@ -299,13 +304,17 @@ class UpgradeStationDisplay {
 
     private void updateProgressBar() {
         Inventory inventory = gui.getInventory();
+        int start = gui.getSlotProgressStart();
+        int length = gui.getProgressLength();
+        if (!hasSlot(start) || length <= 0) return;
+
         double successRate = calculateActualSuccessRate();
-        int filledSlots = (int) Math.round(successRate * gui.getProgressLength());
+        int filledSlots = (int) Math.round(successRate * length);
 
-        gui.setSlotItem(gui.getSlotProgressStart() - 1, createProgressLabel(successRate));
+        gui.setSlotItem(start - 1, createProgressLabel(successRate));
 
-        for (int i = 0; i < gui.getProgressLength(); i++) {
-            int slot = gui.getSlotProgressStart() + i;
+        for (int i = 0; i < length; i++) {
+            int slot = start + i;
             if (slot >= gui.getInventorySize()) break;
 
             Material material;
@@ -353,50 +362,101 @@ class UpgradeStationDisplay {
             String colorCode = getSuccessColor(successRate);
             meta.setDisplayName(gui.color("&f成功率: " + colorCode + String.format("%.1f%%", successRate * 100)));
 
-            List<String> lore = new ArrayList<>();
-            lore.add(gui.color("&7"));
-
             double baseSuccess = getBaseSuccessFromStone();
-            lore.add(gui.color(gui.getMessage("base-rate", "&7基础成功率: &f{rate}%")
-                    .replace("{rate}", String.format("%.1f", baseSuccess * 100))));
-
             double decayedSuccess = getDecayedSuccessRate();
-            if (decayedSuccess < baseSuccess - 0.001) {
-                lore.add(gui.color(gui.getMessage("decayed-rate", "&7等级衰减后: &f{rate}%")
-                        .replace("{rate}", String.format("%.1f", decayedSuccess * 100))));
-            }
-
             double chanceBonus = gui.getAuxiliaryChanceBonus();
-            if (chanceBonus > 0) {
-                lore.add(gui.color(gui.getMessage("lucky-bonus", "&a× 幸运石: &f×(1+{rate}%)")
-                        .replace("{rate}", String.format("%.1f", chanceBonus))));
-            }
 
-            ItemStack targetItem = gui.getInventory().getItem(gui.getSlotTargetItem());
-            if (targetItem != null && targetItem.getType() != Material.AIR) {
-                GuaranteeManager gm = MMOItems.plugin.getUpgrades().getGuaranteeManager();
-                if (gm != null && gm.isEnabled()) {
-                    int fails = gm.getConsecutiveFails(targetItem);
-                    int threshold = gm.getThreshold();
-                    if (fails > 0) {
-                        lore.add(gui.color("&7"));
-                        lore.add(gui.color(gui.getMessage("guarantee-progress", "&6保底进度: &f{current}/{max}")
-                                .replace("{current}", String.valueOf(fails))
-                                .replace("{max}", String.valueOf(threshold))));
-                        if (gm.isGuaranteed(targetItem)) {
-                            lore.add(gui.color(gui.getMessage("guarantee-triggered", "&6★ 已触发保底！必定成功 ★")));
-                        }
-                    }
-                }
-            }
-
-            meta.setLore(lore);
+            List<String> baseLore = meta.hasLore() ? new ArrayList<>(meta.getLore()) : new ArrayList<>();
+            List<String> customLore = formatProgressLore(baseLore, successRate, baseSuccess, decayedSuccess, chanceBonus, colorCode);
+            meta.setLore(customLore);
             item.setItemMeta(meta);
         }
         return item;
     }
 
+    /**
+     * 允许配置 items.progress-label.lore 使用占位符：
+     * {rate} 当前成功率%（一位小数），{color} 颜色码，
+     * {base} 基础成功率%，{decayed} 衰减后成功率%，{bonus} 幸运石加成%，
+     * {guarantee_current}/{guarantee_max} 保底计数。
+     * 若配置为空，则使用默认拼装逻辑。
+     */
+    private List<String> formatProgressLore(List<String> configLore,
+                                            double successRate,
+                                            double baseSuccess,
+                                            double decayedSuccess,
+                                            double chanceBonus,
+                                            String colorCode) {
+        // 格式化数值
+        String rateStr = String.format("%.1f", successRate * 100);
+        String baseStr = String.format("%.1f", baseSuccess * 100);
+        String decayedStr = String.format("%.1f", decayedSuccess * 100);
+        String bonusStr = String.format("%.1f", chanceBonus);
+
+        // 保底数据
+        String guaranteeCurrent = "0";
+        String guaranteeMax = "0";
+        ItemStack targetItem = gui.getItemAt(gui.getSlotTargetItem());
+        GuaranteeManager gm = MMOItems.plugin.getUpgrades().getGuaranteeManager();
+        boolean hasGuarantee = false;
+        boolean triggered = false;
+        if (targetItem != null && targetItem.getType() != Material.AIR && gm != null && gm.isEnabled()) {
+            int fails = gm.getConsecutiveFails(targetItem);
+            int threshold = gm.getThreshold();
+            guaranteeCurrent = String.valueOf(fails);
+            guaranteeMax = String.valueOf(threshold);
+            hasGuarantee = fails > 0;
+            triggered = gm.isGuaranteed(targetItem);
+        }
+
+        // 有自定义 lore 时执行占位符替换
+        if (!configLore.isEmpty()) {
+            List<String> filled = new ArrayList<>();
+            for (String line : configLore) {
+                String replaced = line
+                        .replace("{rate}", rateStr)
+                        .replace("{color}", colorCode)
+                        .replace("{base}", baseStr)
+                        .replace("{decayed}", decayedStr)
+                        .replace("{bonus}", bonusStr)
+                        .replace("{guarantee_current}", guaranteeCurrent)
+                        .replace("{guarantee_max}", guaranteeMax);
+                // 如果需要显示“已触发保底”可以在配置中自行写入文本，不强制拼接
+                filled.add(gui.color(replaced));
+            }
+            return filled;
+        }
+
+        // 默认拼装逻辑（原行为）
+        List<String> lore = new ArrayList<>();
+        lore.add(gui.color("&7"));
+        lore.add(gui.color(gui.getMessage("base-rate", "&7基础成功率: &f{rate}%")
+                .replace("{rate}", baseStr)));
+
+        if (decayedSuccess < baseSuccess - 0.001) {
+            lore.add(gui.color(gui.getMessage("decayed-rate", "&7等级衰减后: &f{rate}%")
+                    .replace("{rate}", decayedStr)));
+        }
+
+        if (chanceBonus > 0) {
+            lore.add(gui.color(gui.getMessage("lucky-bonus", "&a× 幸运石: &f×(1+{rate}%)")
+                    .replace("{rate}", bonusStr)));
+        }
+
+        if (hasGuarantee) {
+            lore.add(gui.color("&7"));
+            lore.add(gui.color(gui.getMessage("guarantee-progress", "&6保底进度: &f{current}/{max}")
+                    .replace("{current}", guaranteeCurrent)
+                    .replace("{max}", guaranteeMax)));
+            if (triggered) {
+                lore.add(gui.color(gui.getMessage("guarantee-triggered", "&6★ 已触发保底！必定成功 ★")));
+            }
+        }
+        return lore;
+    }
+
     private void updateInfoPanel() {
+        if (!hasSlot(gui.getSlotInfoPanel())) return;
         ItemStack item = gui.createConfigItem("items.info-panel", Material.BOOK, "&e&l强化信息");
         ItemMeta meta = item.getItemMeta();
         if (meta != null) {
@@ -420,7 +480,7 @@ class UpgradeStationDisplay {
                         .replace("{remaining}", String.valueOf(remaining))));
             }
 
-            ItemStack targetItem = gui.getInventory().getItem(gui.getSlotTargetItem());
+            ItemStack targetItem = gui.getItemAt(gui.getSlotTargetItem());
             if (targetItem != null && targetItem.getType() != Material.AIR) {
                 VolatileMMOItem volatileTarget = new VolatileMMOItem(NBTItem.get(targetItem));
                 if (volatileTarget.getNBT().hasType() && volatileTarget.hasData(ItemStats.UPGRADE)) {
@@ -513,6 +573,7 @@ class UpgradeStationDisplay {
     }
 
     void updateUpgradeButton() {
+        if (!hasSlot(gui.getSlotUpgradeButton())) return;
         boolean canUpgrade = gui.canPerformUpgrade();
         ItemStack button;
 
@@ -541,8 +602,7 @@ class UpgradeStationDisplay {
     }
 
     private double calculateActualSuccessRate() {
-        Inventory inventory = gui.getInventory();
-        ItemStack targetItem = inventory.getItem(gui.getSlotTargetItem());
+        ItemStack targetItem = gui.getItemAt(gui.getSlotTargetItem());
         if (targetItem == null || targetItem.getType() == Material.AIR) return 0;
 
         VolatileMMOItem mmoItem = new VolatileMMOItem(NBTItem.get(targetItem));
@@ -573,8 +633,7 @@ class UpgradeStationDisplay {
     }
 
     private double getBaseSuccessFromStone() {
-        Inventory inventory = gui.getInventory();
-        ItemStack stoneItem = inventory.getItem(gui.getSlotUpgradeStone());
+        ItemStack stoneItem = gui.getItemAt(gui.getSlotUpgradeStone());
         if (stoneItem == null || stoneItem.getType() == Material.AIR) return 1.0;
 
         VolatileMMOItem stoneMmo = new VolatileMMOItem(NBTItem.get(stoneItem));
@@ -586,8 +645,7 @@ class UpgradeStationDisplay {
     }
 
     private double getDecayedSuccessRate() {
-        Inventory inventory = gui.getInventory();
-        ItemStack targetItem = inventory.getItem(gui.getSlotTargetItem());
+        ItemStack targetItem = gui.getItemAt(gui.getSlotTargetItem());
         if (targetItem == null || targetItem.getType() == Material.AIR) return 0;
 
         VolatileMMOItem mmoItem = new VolatileMMOItem(NBTItem.get(targetItem));
@@ -613,9 +671,8 @@ class UpgradeStationDisplay {
 
     private List<String> getUpgradeBlockReasons() {
         List<String> reasons = new ArrayList<>();
-        Inventory inventory = gui.getInventory();
-        ItemStack targetItem = inventory.getItem(gui.getSlotTargetItem());
-        ItemStack stoneItem = inventory.getItem(gui.getSlotUpgradeStone());
+        ItemStack targetItem = gui.getItemAt(gui.getSlotTargetItem());
+        ItemStack stoneItem = gui.getItemAt(gui.getSlotUpgradeStone());
 
         if (targetItem == null || targetItem.getType() == Material.AIR) {
             reasons.add(gui.color(gui.getMessage("block-no-item", "&c? 请放入待强化物品")));

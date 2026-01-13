@@ -33,6 +33,9 @@ import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.InventoryHolder;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.meta.ItemMeta;
+import org.bukkit.NamespacedKey;
+import org.bukkit.persistence.PersistentDataContainer;
+import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.scheduler.BukkitTask;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
@@ -78,6 +81,25 @@ public class UpgradeStationGUI implements InventoryHolder, Listener {
     private static long lastConfigLoad = 0;
     private static final long CONFIG_CACHE_TIME = 60000; // 1分钟缓存
 
+    public static void invalidateConfigCache() {
+        config = null;
+        lastConfigLoad = 0;
+    }
+
+    private static NamespacedKey displayItemKey() {
+        return new NamespacedKey(MMOItems.plugin, "upgrade_station_display_item");
+    }
+
+    public static void reloadConfigFromDisk() {
+        ConfigFile primary = new ConfigFile("upgrade-station");
+        if (primary.exists()) {
+            config = primary.getConfig();
+        } else {
+            config = new ConfigFile("/default", "upgrade-station").getConfig();
+        }
+        lastConfigLoad = System.currentTimeMillis();
+    }
+
     // ===== 槽位配置 =====
     private int slotTargetItem;
     private int slotUpgradeStone;
@@ -90,6 +112,12 @@ public class UpgradeStationGUI implements InventoryHolder, Listener {
     private int slotCloseButton;
     private int slotProgressStart;
     private int progressLength;
+
+    // map 布局缓存
+    private final Map<Integer, String> mappedItems = new HashMap<>();
+    private final Map<Integer, String> mappedBinds = new HashMap<>();
+    private final Map<Integer, String> mappedBindDisplays = new HashMap<>();
+    private boolean mapLayoutActive = false;
 
     // ===== 安全配置 =====
     private long upgradeCooldown;
@@ -108,6 +136,8 @@ public class UpgradeStationGUI implements InventoryHolder, Listener {
     private boolean processing = false; // 防止并发操作
     private BukkitTask updateTask;
 
+    private boolean configValid = true;
+
     // ===== 物品快照（用于验证） =====
     private ItemStack targetSnapshot;
     private ItemStack stoneSnapshot;
@@ -125,21 +155,37 @@ public class UpgradeStationGUI implements InventoryHolder, Listener {
         rows = Math.max(1, Math.min(6, rows));
         this.inventorySize = rows * 9;
 
+        validateRequiredBinds();
+
         String title = color(getConfig().getString("gui.title", "&5&l强化工作台"));
-        this.inventory = Bukkit.createInventory(this, inventorySize, title);
+        this.inventory = Bukkit.createInventory(this, inventorySize, title);    
         this.display = new UpgradeStationDisplay(this);
 
         setupInventory();
+    }
+
+    private void validateRequiredBinds() {
+        // 允许“可选槽”缺失（如辅料/进度条/信息面板），但核心交互必须存在。
+        List<String> missing = new ArrayList<>();
+        if (slotTargetItem < 0) missing.add("target-item");
+        if (slotUpgradeStone < 0) missing.add("upgrade-stone");
+        if (slotPreview < 0) missing.add("preview");
+        if (slotUpgradeButton < 0) missing.add("upgrade-button");
+        if (slotCloseButton < 0) missing.add("close-button");
+
+        if (!missing.isEmpty()) {
+            configValid = false;
+            MMOItems.print(null, "upgrade-station: missing required bind(s): " + String.join(", ", missing), null);
+        }
     }
 
     /**
      * 加载配置
      */
     private void loadConfig() {
-        // 配置缓存
-        if (config == null || System.currentTimeMillis() - lastConfigLoad > CONFIG_CACHE_TIME) {
-            config = new ConfigFile("/default", "upgrade-station").getConfig();
-            lastConfigLoad = System.currentTimeMillis();
+        // 仅在启动后首次或外部显式重载后为 null 时加载；平时不走定时过期，避免重复磁盘 IO。
+        if (config == null) {
+            reloadConfigFromDisk();
         }
 
         loadSlotsFromConfig();
@@ -171,6 +217,8 @@ public class UpgradeStationGUI implements InventoryHolder, Listener {
      * 加载功能槽位；优先 slots.*，否则从 layout 的 bind 定义获取；最后回退默认值
      */
     private void loadSlotsFromConfig() {
+        if (parseMapLayout()) return;
+
         ConfigurationSection slots = getConfig().getConfigurationSection("slots");
         if (slots != null && !slots.getKeys(false).isEmpty()) {
             slotTargetItem = slots.getInt("target-item", 11);
@@ -187,9 +235,9 @@ public class UpgradeStationGUI implements InventoryHolder, Listener {
             return;
         }
 
-        // layout 绑定
+        // fallback layout 绑定
         Map<String, List<Integer>> binds = new HashMap<>();
-        for (Map<String, Object> entry : safeLayoutList()) {
+        for (Map<String, Object> entry : safeLayoutListLegacy()) {
             Object bindObj = entry.get("bind");
             if (bindObj == null) continue;
             List<Integer> parsed = parseSlots(entry.get("slot"), entry.get("slots"));
@@ -229,10 +277,21 @@ public class UpgradeStationGUI implements InventoryHolder, Listener {
      * 初始化 GUI 布局
      */
     private void setupInventory() {
-        // 填充背景
-        ItemStack filler = createConfigItem("items.filler", Material.BLACK_STAINED_GLASS_PANE, " ");
-        for (int i = 0; i < inventorySize; i++) {
-            inventory.setItem(i, filler);
+        if (!configValid) {
+            return;
+        }
+        boolean fillBackground = getConfig().getBoolean("gui.fill-background", true);
+
+        // 填充背景（可关闭）
+        if (fillBackground) {
+            ItemStack filler = createConfigItem("items.filler", Material.BLACK_STAINED_GLASS_PANE, " ");
+            for (int i = 0; i < inventorySize; i++) {
+                inventory.setItem(i, filler);
+            }
+        } else {
+            for (int i = 0; i < inventorySize; i++) {
+                inventory.setItem(i, null);
+            }
         }
 
         // 设置功能槽位为空
@@ -241,6 +300,13 @@ public class UpgradeStationGUI implements InventoryHolder, Listener {
         setSlotEmpty(slotLuckyStone);
         setSlotEmpty(slotProtectStone);
         setSlotEmpty(slotDirectStone);
+
+        // map 布局：只渲染 layout-map + legend，不执行默认布局/旧 layout
+        if (mapLayoutActive) {
+            applyMapLayoutIfPresent();
+            display.updateAllDisplays();
+            return;
+        }
 
         List<Map<String, Object>> customLayout = safeLayoutList();
         boolean hasCustomLayout = !customLayout.isEmpty();
@@ -317,6 +383,31 @@ public class UpgradeStationGUI implements InventoryHolder, Listener {
                 setSlotItem(slot, item);
             }
         }
+
+        // map 定义的物品覆盖（在自定义 layout 基础上再覆盖，便于复用 legend）
+        applyMapLayoutIfPresent();
+    }
+
+    private void applyMapLayoutIfPresent() {
+        if (mappedItems.isEmpty() && mappedBinds.isEmpty()) return;
+
+        for (Map.Entry<Integer, String> e : mappedItems.entrySet()) {
+            int slot = e.getKey();
+            String itemKey = e.getValue();
+            setSlotItem(slot, createConfigItem("items." + itemKey, Material.PAPER, "&7"));
+        }
+
+        // 功能槽位清空，等待玩家交互
+        for (Integer slot : mappedBinds.keySet()) {
+            setSlotEmpty(slot);
+            String display = mappedBindDisplays.get(slot);
+            if (display != null && !display.isEmpty()) {
+                ItemStack displayItem = createConfigItem("items." + display, Material.BARRIER, "&c?");
+                if (displayItem != null && displayItem.getType() != Material.AIR) {
+                    setSlotItem(slot, markAsDisplayItem(displayItem));
+                }
+            }
+        }
     }
 
     private List<Integer> parseSlots(Object primary, Object secondary) {
@@ -366,6 +457,128 @@ public class UpgradeStationGUI implements InventoryHolder, Listener {
         return result;
     }
 
+    private List<Map<String, Object>> safeLayoutListLegacy() {
+        return safeLayoutList();
+    }
+
+    private boolean parseMapLayout() {
+        List<String> mapLines = getConfig().getStringList("layout-map");
+        if (mapLines == null || mapLines.isEmpty()) {
+            mapLayoutActive = false;
+            return false;
+        }
+
+        // 先清空所有槽位定义，避免“没在 layout-map 里出现但仍旧固定显示”的残留
+        slotTargetItem = -1;
+        slotUpgradeStone = -1;
+        slotPreview = -1;
+        slotLuckyStone = -1;
+        slotProtectStone = -1;
+        slotDirectStone = -1;
+        slotUpgradeButton = -1;
+        slotInfoPanel = -1;
+        slotCloseButton = -1;
+        slotProgressStart = -1;
+        progressLength = 0;
+
+        ConfigurationSection legend = getConfig().getConfigurationSection("legend");
+        if (legend == null || legend.getKeys(false).isEmpty()) {
+            MMOItems.print(null, "upgrade-station: legend missing while layout-map present", null);
+            mapLayoutActive = false;
+            return false;
+        }
+
+        int cols = mapLines.get(0).length();
+        for (String line : mapLines) {
+            if (line.length() != cols) {
+                MMOItems.print(null, "upgrade-station: layout-map lines must have equal length", null);
+                mapLayoutActive = false;
+                return false;
+            }
+        }
+
+        // 清空旧映射
+        mappedItems.clear();
+        mappedBinds.clear();
+        mappedBindDisplays.clear();
+        mapLayoutActive = true;
+
+        // 行列转换为 slot
+        for (int r = 0; r < mapLines.size(); r++) {
+            String line = mapLines.get(r);
+            for (int c = 0; c < line.length(); c++) {
+                char ch = line.charAt(c);
+                String key = String.valueOf(ch);
+                ConfigurationSection entry = legend.getConfigurationSection(key);
+                if (entry == null) continue; // 未映射字符允许跳过
+                String type = entry.getString("type", "item").toLowerCase(Locale.ROOT);
+                String ref = entry.getString("ref");
+                String display = entry.getString("display");
+                int slot = r * 9 + c;
+                if (slot >= 54) continue; // GUI 最大 6 行
+                if ("item".equals(type)) {
+                    mappedItems.put(slot, ref);
+                } else if ("bind".equals(type)) {
+                    mappedBinds.put(slot, ref);
+                    if (display != null && !display.isEmpty()) {
+                        mappedBindDisplays.put(slot, display);
+                    }
+                    applyBindSlot(ref, slot);
+                }
+            }
+        }
+
+        // 进度条从 legend 中读取
+        int progressStartLegend = -1;
+        int progressLenLegend = 0;
+        for (Map.Entry<Integer, String> e : mappedBinds.entrySet()) {
+            if ("progress-bar".equals(e.getValue())) {
+                if (progressStartLegend == -1) progressStartLegend = e.getKey();
+                progressLenLegend++;
+            }
+        }
+        if (progressStartLegend != -1 && progressLenLegend > 0) {
+            slotProgressStart = progressStartLegend;
+            progressLength = progressLenLegend;
+        }
+
+        return true;
+    }
+
+    private void applyBindSlot(String ref, int slot) {
+        switch (ref) {
+            case "target-item":
+                slotTargetItem = slot;
+                break;
+            case "upgrade-stone":
+                slotUpgradeStone = slot;
+                break;
+            case "preview":
+                slotPreview = slot;
+                break;
+            case "lucky-stone":
+                slotLuckyStone = slot;
+                break;
+            case "protect-stone":
+                slotProtectStone = slot;
+                break;
+            case "direct-stone":
+                slotDirectStone = slot;
+                break;
+            case "upgrade-button":
+                slotUpgradeButton = slot;
+                break;
+            case "info-panel":
+                slotInfoPanel = slot;
+                break;
+            case "close-button":
+                slotCloseButton = slot;
+                break;
+            default:
+                break;
+        }
+    }
+
     /**
      * 从配置创建物品
      */
@@ -376,6 +589,7 @@ public class UpgradeStationGUI implements InventoryHolder, Listener {
         String name = defaultName;
         List<String> lore = new ArrayList<>();
         boolean hide = false;
+        int customModelData = -1;
 
         if (section != null) {
             String matStr = section.getString("material");
@@ -388,6 +602,7 @@ public class UpgradeStationGUI implements InventoryHolder, Listener {
             name = section.getString("name", defaultName);
             lore = section.getStringList("lore");
             hide = section.getBoolean("hide", false);
+            customModelData = section.getInt("custom-model-data", -1);
         }
 
         if (hide) {
@@ -398,6 +613,9 @@ public class UpgradeStationGUI implements InventoryHolder, Listener {
         ItemMeta meta = item.getItemMeta();
         if (meta != null) {
             meta.setDisplayName(color(name));
+            if (customModelData > 0) {
+                meta.setCustomModelData(customModelData);
+            }
             if (!lore.isEmpty()) {
                 List<String> coloredLore = new ArrayList<>();
                 for (String line : lore) {
@@ -413,7 +631,7 @@ public class UpgradeStationGUI implements InventoryHolder, Listener {
     // ===== 辅助数值 =====
 
     double getAuxiliaryChanceBonus() {
-        ItemStack luckyStone = inventory.getItem(slotLuckyStone);
+        ItemStack luckyStone = getItemAt(slotLuckyStone);
         if (luckyStone == null || luckyStone.getType() == Material.AIR) return 0;
 
         NBTItem nbt = NBTItem.get(luckyStone);
@@ -424,7 +642,7 @@ public class UpgradeStationGUI implements InventoryHolder, Listener {
     }
 
     double getAuxiliaryProtection() {
-        ItemStack protectStone = inventory.getItem(slotProtectStone);
+        ItemStack protectStone = getItemAt(slotProtectStone);
         if (protectStone == null || protectStone.getType() == Material.AIR) return 0;
 
         NBTItem nbt = NBTItem.get(protectStone);
@@ -435,7 +653,7 @@ public class UpgradeStationGUI implements InventoryHolder, Listener {
     }
 
     double getAuxiliaryDirectUpChance() {
-        ItemStack directStone = inventory.getItem(slotDirectStone);
+        ItemStack directStone = getItemAt(slotDirectStone);
         if (directStone == null || directStone.getType() == Material.AIR) return 0;
 
         NBTItem nbt = NBTItem.get(directStone);
@@ -446,7 +664,7 @@ public class UpgradeStationGUI implements InventoryHolder, Listener {
     }
 
     int getAuxiliaryDirectUpLevels() {
-        ItemStack directStone = inventory.getItem(slotDirectStone);
+        ItemStack directStone = getItemAt(slotDirectStone);
         if (directStone == null || directStone.getType() == Material.AIR) return 0;
 
         NBTItem nbt = NBTItem.get(directStone);
@@ -459,8 +677,8 @@ public class UpgradeStationGUI implements InventoryHolder, Listener {
     boolean canPerformUpgrade() {
         if (processing) return false;
 
-        ItemStack targetItem = inventory.getItem(slotTargetItem);
-        ItemStack stoneItem = inventory.getItem(slotUpgradeStone);
+        ItemStack targetItem = getItemAt(slotTargetItem);
+        ItemStack stoneItem = getItemAt(slotUpgradeStone);
 
         if (targetItem == null || targetItem.getType() == Material.AIR) return false;
         if (stoneItem == null || stoneItem.getType() == Material.AIR) return false;
@@ -518,8 +736,8 @@ public class UpgradeStationGUI implements InventoryHolder, Listener {
         UPGRADE_COOLDOWNS.put(player.getUniqueId(), System.currentTimeMillis());
         display.updateUpgradeButton();
 
-        ItemStack targetItem = inventory.getItem(slotTargetItem);
-        ItemStack stoneItem = inventory.getItem(slotUpgradeStone);
+        ItemStack targetItem = getItemAt(slotTargetItem);
+        ItemStack stoneItem = getItemAt(slotUpgradeStone);
         double stoneBaseSuccess = getSuccessFromStoneItem(stoneItem);
         double auxiliaryChanceBonus = getAuxiliaryChanceBonus();
         double auxiliaryProtection = getAuxiliaryProtection();
@@ -681,8 +899,8 @@ public class UpgradeStationGUI implements InventoryHolder, Listener {
      * 验证物品未被非法修改
      */
     private boolean validateItems() {
-        ItemStack currentTarget = inventory.getItem(slotTargetItem);
-        ItemStack currentStone = inventory.getItem(slotUpgradeStone);
+        ItemStack currentTarget = getItemAt(slotTargetItem);
+        ItemStack currentStone = getItemAt(slotUpgradeStone);
 
         // 简单验证：物品仍然存在且类型相同
         if (currentTarget == null || currentTarget.getType() == Material.AIR) return false;
@@ -700,7 +918,7 @@ public class UpgradeStationGUI implements InventoryHolder, Listener {
     private void consumeOneAuxiliaryStone(int slot, boolean shouldConsume) {
         if (!shouldConsume) return;
 
-        ItemStack stone = inventory.getItem(slot);
+        ItemStack stone = getItemAt(slot);
         if (stone == null || stone.getType() == Material.AIR) return;
 
         stone.setAmount(stone.getAmount() - 1);
@@ -712,6 +930,11 @@ public class UpgradeStationGUI implements InventoryHolder, Listener {
     // ===== GUI 控制 =====
 
     public void open() {
+        if (!configValid) {
+            player.sendMessage(color("&c强化台配置无效：缺少必要槽位绑定（target-item/upgrade-stone/preview/upgrade-button/close-button）。"));
+            player.sendMessage(color("&7请检查 &fplugins/MMOItems/upgrade-station.yml &7的 layout-map 与 legend。"));
+            return;
+        }
         if (!registered) {
             Bukkit.getPluginManager().registerEvents(this, MMOItems.plugin);
             registered = true;
@@ -744,7 +967,7 @@ public class UpgradeStationGUI implements InventoryHolder, Listener {
         int[] returnSlots = {slotTargetItem, slotUpgradeStone, slotLuckyStone, slotProtectStone, slotDirectStone};
         for (int slot : returnSlots) {
             if (slot < 0 || slot >= inventorySize) continue;
-            ItemStack item = inventory.getItem(slot);
+            ItemStack item = getItemAt(slot);
             if (item != null && item.getType() != Material.AIR) {
                 HashMap<Integer, ItemStack> overflow = player.getInventory().addItem(item.clone());
                 for (ItemStack drop : overflow.values()) {
@@ -758,6 +981,22 @@ public class UpgradeStationGUI implements InventoryHolder, Listener {
     private boolean isFunctionalSlot(int slot) {
         return slot == slotTargetItem || slot == slotUpgradeStone ||
                 slot == slotLuckyStone || slot == slotProtectStone || slot == slotDirectStone;
+    }
+
+    private boolean isDisplayItem(@Nullable ItemStack item) {
+        if (item == null || item.getType() == Material.AIR) return false;
+        ItemMeta meta = item.getItemMeta();
+        if (meta == null) return false;
+        PersistentDataContainer pdc = meta.getPersistentDataContainer();
+        return pdc.has(displayItemKey(), PersistentDataType.BYTE);
+    }
+
+    private ItemStack markAsDisplayItem(@NotNull ItemStack item) {
+        ItemMeta meta = item.getItemMeta();
+        if (meta == null) return item;
+        meta.getPersistentDataContainer().set(displayItemKey(), PersistentDataType.BYTE, (byte) 1);
+        item.setItemMeta(meta);
+        return item;
     }
 
     // ===== 工具方法 =====
@@ -861,6 +1100,17 @@ public class UpgradeStationGUI implements InventoryHolder, Listener {
         return inventory;
     }
 
+    @Nullable
+    ItemStack getItemAt(int slot) {
+        if (slot < 0 || slot >= inventorySize) return null;
+        return inventory.getItem(slot);
+    }
+
+    void clearSlot(int slot) {
+        if (slot < 0 || slot >= inventorySize) return;
+        inventory.setItem(slot, null);
+    }
+
     // ===== 事件处理 =====
 
     @EventHandler(priority = EventPriority.HIGHEST)
@@ -921,6 +1171,17 @@ public class UpgradeStationGUI implements InventoryHolder, Listener {
 
         // 功能槽位：允许放置/取出
         if (isFunctionalSlot(slot)) {
+            // 若当前槽位是“展示占位物品”，禁止拿走，但允许直接覆盖放入玩家物品
+            if (isDisplayItem(event.getCurrentItem())) {
+                ItemStack cursor = event.getCursor();
+                boolean hasCursorItem = cursor != null && cursor.getType() != Material.AIR;
+                if (!hasCursorItem) {
+                    event.setCancelled(true);
+                    playSound("sounds.deny");
+                    return;
+                }
+            }
+
             // 播放放入音效
             Bukkit.getScheduler().runTaskLater(MMOItems.plugin, () -> {
                 playSound("sounds.item-place");
